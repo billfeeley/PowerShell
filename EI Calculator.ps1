@@ -1,4 +1,10 @@
-# Create a GUI form with necessary fields
+<#=====================================================================================================================
+ Script Name: EI Calculator.ps1
+ Description: Will calculate Developmental Delay for the therapist based on criteria entered
+ Requirements: Scripts must be allowed to run for the user
+=======================================================================================================================#>
+
+# Create a GUI form with the necessary fields
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
