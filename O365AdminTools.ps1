@@ -1,641 +1,700 @@
-#requires -Modules ExchangeOnlineManagement
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-# ================================================================================
+# ----------------------------
 # Helper Functions
-# ================================================================================
-
-function Test-MailAlias {
-    param([string]$Alias)
-    if ([string]::IsNullOrWhiteSpace($Alias)) { return $false }
-    if ($Alias -match '[@\s]') { return $false }
-    return $Alias -match '^[A-Za-z0-9][A-Za-z0-9\!\#\$\%\&''\*\+\-\/=\?\^_`\{\|\}~\.]*[A-Za-z0-9]$' -or $Alias.Length -eq 1
-}
-
-function Split-Entries {
-    param([string]$Text)
-    $raw = ($Text -split "(`r`n|`n|,|;)" | ForEach-Object { $_.Trim() }) | Where-Object { $_ }
-    return $raw | Select-Object -Unique
-}
+# ----------------------------
 
 function Write-Log {
-    param($tb, [string]$msg)
-    $tb.AppendText("[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $msg`r`n")
-    $tb.SelectionStart = $tb.TextLength
-    $tb.ScrollToCaret()
+    param([string]$Message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $txtLog.AppendText("[$timestamp] $Message`r`n")
+    $txtLog.SelectionStart = $txtLog.Text.Length
+    $txtLog.ScrollToCaret()
+    [System.Windows.Forms.Application]::DoEvents()
 }
 
-function Get-RecipientSafe {
-    param([string]$Identity)
-    try { return Get-Recipient -Identity $Identity -ErrorAction Stop }
-    catch { return $null }
-}
-
-function Get-CalendarIdentity {
-    <#
-    .SYNOPSIS
-    Returns the mailbox folder path for the calendar (e.g. "user@domain.com:\Calendar").
-    Falls back to folder statistics for non-English tenants where the folder name differs.
-    #>
-    param([string]$Mailbox)
-    $defaultPath = "${Mailbox}:\Calendar"
+function Test-ExchangeConnection {
     try {
-        # Quick check — if this works we're done
-        Get-MailboxFolderPermission -Identity $defaultPath -ErrorAction Stop | Out-Null
-        return $defaultPath
+        Get-EXOMailbox -ResultSize 1 -ErrorAction Stop | Out-Null
+        return $true
     }
-    catch {
-        try {
-            $calFolder = Get-MailboxFolderStatistics -Identity $Mailbox -FolderScope Calendar -ErrorAction Stop |
-                         Where-Object { $_.FolderType -eq 'Calendar' } |
-                         Select-Object -First 1
-            if ($calFolder) {
-                $fp = $calFolder.FolderPath.TrimStart('/').Replace('/', '\')
-                return "${Mailbox}:\${fp}"
-            }
-        }
-        catch { }
-        return $defaultPath   # Let the caller surface the real error
+    catch { return $false }
+}
+
+function Test-IPPSConnection {
+    try {
+        Get-ComplianceSearch -ResultSize 1 -ErrorAction Stop | Out-Null
+        return $true
+    }
+    catch { return $false }
+}
+
+function Update-ConnectionStatus {
+    $exo  = Test-ExchangeConnection
+    $ipps = Test-IPPSConnection
+
+    if ($exo -and $ipps) {
+        $lblConnStatus.Text      = "EXO + IPPS Connected"
+        $lblConnStatus.ForeColor = [System.Drawing.Color]::Green
+    }
+    elseif ($exo) {
+        $lblConnStatus.Text      = "EXO Connected"
+        $lblConnStatus.ForeColor = [System.Drawing.Color]::DarkOrange
+    }
+    elseif ($ipps) {
+        $lblConnStatus.Text      = "IPPS Connected"
+        $lblConnStatus.ForeColor = [System.Drawing.Color]::DarkOrange
+    }
+    else {
+        $lblConnStatus.Text      = "Not Connected"
+        $lblConnStatus.ForeColor = [System.Drawing.Color]::Red
     }
 }
 
-# ================================================================================
-# Form
-# ================================================================================
+function Build-ContentMatchQuery {
+    param([string[]]$Domains)
 
-$form                = New-Object System.Windows.Forms.Form
-$form.Text           = "O365 Admin Tools"
-$form.Size           = New-Object System.Drawing.Size(960, 730)
-$form.StartPosition  = "CenterScreen"
-$form.MinimumSize    = New-Object System.Drawing.Size(960, 730)
+    $cleanDomains = $Domains |
+        ForEach-Object { $_.Trim().ToLower() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Sort-Object -Unique
 
-$font     = New-Object System.Drawing.Font("Segoe UI", 10)
-$fontBold = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    if (-not $cleanDomains -or $cleanDomains.Count -eq 0) {
+        throw "No domains were provided."
+    }
 
-# ── Shared: TabControl ───────────────────────────────────────────────────────────
-$tabs          = New-Object System.Windows.Forms.TabControl
-$tabs.Location = New-Object System.Drawing.Point(10, 10)
-$tabs.Size     = New-Object System.Drawing.Size(932, 558)
-$tabs.Font     = $font
-$form.Controls.Add($tabs)
+    $domainQuery = ($cleanDomains | ForEach-Object { "participants:`"$_`"" }) -join " OR "
+    return "(folderid:sentitems) AND ($domainQuery)"
+}
 
-# ── Shared: Connect button + status label ────────────────────────────────────────
-$btnConnect          = New-Object System.Windows.Forms.Button
-$btnConnect.Text     = "Connect to EXO"
-$btnConnect.Location = New-Object System.Drawing.Point(20, 578)
-$btnConnect.Size     = New-Object System.Drawing.Size(155, 35)
-$btnConnect.Font     = $font
-$form.Controls.Add($btnConnect)
+function Wait-ComplianceSearchComplete {
+    param(
+        [string]$SearchName,
+        [int]$PollSeconds = 5,
+        [int]$TimeoutMinutes = 20
+    )
 
-$lblConnStatus           = New-Object System.Windows.Forms.Label
-$lblConnStatus.Text      = "Not connected"
-$lblConnStatus.Location  = New-Object System.Drawing.Point(185, 588)
-$lblConnStatus.AutoSize  = $true
-$lblConnStatus.ForeColor = [System.Drawing.Color]::Gray
-$lblConnStatus.Font      = $font
-$form.Controls.Add($lblConnStatus)
+    $start = Get-Date
+    do {
+        Start-Sleep -Seconds $PollSeconds
+        $search = Get-ComplianceSearch -Identity $SearchName -ErrorAction Stop
+        Write-Log "Search status: $($search.Status)"
+        if ($search.Status -in @("Completed","PartiallySucceeded","Failed","Stopped")) {
+            return $search
+        }
+    } while ((Get-Date) -lt $start.AddMinutes($TimeoutMinutes))
 
-# ── Shared: Log box ──────────────────────────────────────────────────────────────
-$txtLog          = New-Object System.Windows.Forms.TextBox
-$txtLog.Location = New-Object System.Drawing.Point(20, 623)
-$txtLog.Size     = New-Object System.Drawing.Size(915, 82)
+    throw "Timed out waiting for compliance search to finish."
+}
+
+# ----------------------------
+# Main Form
+# ----------------------------
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text        = "Microsoft 365 User Activity Audit"
+$form.Size        = New-Object System.Drawing.Size(980, 840)
+$form.StartPosition = "CenterScreen"
+$form.MinimumSize = New-Object System.Drawing.Size(980, 840)
+
+# -----------------------------------------------
+# TOP PANEL  --  shared user email + connections
+# -----------------------------------------------
+
+$pnlTop = New-Object System.Windows.Forms.Panel
+$pnlTop.Location    = New-Object System.Drawing.Point(0, 0)
+$pnlTop.Size        = New-Object System.Drawing.Size(980, 62)
+$pnlTop.BorderStyle = "FixedSingle"
+$pnlTop.BackColor   = [System.Drawing.Color]::WhiteSmoke
+$form.Controls.Add($pnlTop)
+
+$lblUser = New-Object System.Windows.Forms.Label
+$lblUser.Location = New-Object System.Drawing.Point(10, 9)
+$lblUser.Size     = New-Object System.Drawing.Size(115, 20)
+$lblUser.Text     = "User Email Address:"
+$pnlTop.Controls.Add($lblUser)
+
+$txtUserEmail = New-Object System.Windows.Forms.TextBox
+$txtUserEmail.Location = New-Object System.Drawing.Point(130, 6)
+$txtUserEmail.Size     = New-Object System.Drawing.Size(270, 26)
+$pnlTop.Controls.Add($txtUserEmail)
+
+$btnConnectEXO = New-Object System.Windows.Forms.Button
+$btnConnectEXO.Location = New-Object System.Drawing.Point(420, 5)
+$btnConnectEXO.Size     = New-Object System.Drawing.Size(195, 28)
+$btnConnectEXO.Text     = "Connect Exchange Online"
+$pnlTop.Controls.Add($btnConnectEXO)
+
+$btnConnectIPPS = New-Object System.Windows.Forms.Button
+$btnConnectIPPS.Location = New-Object System.Drawing.Point(625, 5)
+$btnConnectIPPS.Size     = New-Object System.Drawing.Size(200, 28)
+$btnConnectIPPS.Text     = "Connect IPPS / Compliance"
+$pnlTop.Controls.Add($btnConnectIPPS)
+
+$lblConnStatus = New-Object System.Windows.Forms.Label
+$lblConnStatus.Location  = New-Object System.Drawing.Point(835, 9)
+$lblConnStatus.Size      = New-Object System.Drawing.Size(130, 20)
+$lblConnStatus.Text      = "Not Connected"
+$lblConnStatus.ForeColor = [System.Drawing.Color]::Red
+$lblConnStatus.Font      = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
+$pnlTop.Controls.Add($lblConnStatus)
+
+$lblIPPSNote = New-Object System.Windows.Forms.Label
+$lblIPPSNote.Location  = New-Object System.Drawing.Point(625, 36)
+$lblIPPSNote.Size      = New-Object System.Drawing.Size(340, 18)
+$lblIPPSNote.Text      = "IPPS required for Email Audit only"
+$lblIPPSNote.ForeColor = [System.Drawing.Color]::Gray
+$lblIPPSNote.Font      = New-Object System.Drawing.Font("Segoe UI", 7.5)
+$pnlTop.Controls.Add($lblIPPSNote)
+
+# -----------------------------------------------
+# TAB CONTROL
+# -----------------------------------------------
+
+$tabControl = New-Object System.Windows.Forms.TabControl
+$tabControl.Location = New-Object System.Drawing.Point(10, 72)
+$tabControl.Size     = New-Object System.Drawing.Size(955, 610)
+$tabControl.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
+$form.Controls.Add($tabControl)
+
+# =====================================================
+#  TAB 1  --  EMAIL AUDIT
+# =====================================================
+
+$tabEmail      = New-Object System.Windows.Forms.TabPage
+$tabEmail.Text = "  Email Audit  "
+$tabControl.Controls.Add($tabEmail)
+
+$lblMailboxNote = New-Object System.Windows.Forms.Label
+$lblMailboxNote.Location = New-Object System.Drawing.Point(10, 14)
+$lblMailboxNote.Size     = New-Object System.Drawing.Size(880, 20)
+$lblMailboxNote.Text     = "Audits sent items in the mailbox entered above. Searches for messages sent to personal email domains listed below."
+$lblMailboxNote.ForeColor = [System.Drawing.Color]::DimGray
+$tabEmail.Controls.Add($lblMailboxNote)
+
+$lblDomains = New-Object System.Windows.Forms.Label
+$lblDomains.Location = New-Object System.Drawing.Point(10, 45)
+$lblDomains.Size     = New-Object System.Drawing.Size(280, 20)
+$lblDomains.Text     = "Personal Email Domains (one per line):"
+$tabEmail.Controls.Add($lblDomains)
+
+$txtDomains = New-Object System.Windows.Forms.TextBox
+$txtDomains.Location   = New-Object System.Drawing.Point(10, 68)
+$txtDomains.Size       = New-Object System.Drawing.Size(300, 185)
+$txtDomains.Multiline  = $true
+$txtDomains.ScrollBars = "Vertical"
+$txtDomains.Text = @"
+gmail.com
+yahoo.com
+outlook.com
+hotmail.com
+icloud.com
+aol.com
+live.com
+msn.com
+me.com
+proton.me
+protonmail.com
+"@
+$tabEmail.Controls.Add($txtDomains)
+
+$btnRunAudit = New-Object System.Windows.Forms.Button
+$btnRunAudit.Location = New-Object System.Drawing.Point(330, 68)
+$btnRunAudit.Size     = New-Object System.Drawing.Size(165, 38)
+$btnRunAudit.Text     = "Run Email Audit"
+$btnRunAudit.BackColor = [System.Drawing.Color]::SteelBlue
+$btnRunAudit.ForeColor = [System.Drawing.Color]::White
+$btnRunAudit.FlatStyle = "Flat"
+$tabEmail.Controls.Add($btnRunAudit)
+
+$btnExportEmail = New-Object System.Windows.Forms.Button
+$btnExportEmail.Location = New-Object System.Drawing.Point(330, 120)
+$btnExportEmail.Size     = New-Object System.Drawing.Size(165, 35)
+$btnExportEmail.Text     = "Export Results CSV"
+$tabEmail.Controls.Add($btnExportEmail)
+
+$lblEmailResults = New-Object System.Windows.Forms.Label
+$lblEmailResults.Location = New-Object System.Drawing.Point(10, 270)
+$lblEmailResults.Size     = New-Object System.Drawing.Size(100, 20)
+$lblEmailResults.Text     = "Results:"
+$tabEmail.Controls.Add($lblEmailResults)
+
+$dgvEmailResults = New-Object System.Windows.Forms.DataGridView
+$dgvEmailResults.Location            = New-Object System.Drawing.Point(10, 293)
+$dgvEmailResults.Size                = New-Object System.Drawing.Size(925, 280)
+$dgvEmailResults.AutoSizeColumnsMode = "Fill"
+$dgvEmailResults.AllowUserToAddRows  = $false
+$dgvEmailResults.ReadOnly            = $true
+$dgvEmailResults.BackgroundColor     = [System.Drawing.Color]::White
+$tabEmail.Controls.Add($dgvEmailResults)
+
+$emailResultTable = New-Object System.Data.DataTable
+[void]$emailResultTable.Columns.Add("Mailbox")
+[void]$emailResultTable.Columns.Add("SearchName")
+[void]$emailResultTable.Columns.Add("Status")
+[void]$emailResultTable.Columns.Add("Items")
+[void]$emailResultTable.Columns.Add("Size")
+[void]$emailResultTable.Columns.Add("Query")
+$dgvEmailResults.DataSource = $emailResultTable
+
+# =====================================================
+#  TAB 2  --  TEAMS / ONEDRIVE / SHAREPOINT AUDIT
+# =====================================================
+
+$tabFile      = New-Object System.Windows.Forms.TabPage
+$tabFile.Text = "  Teams / OneDrive / SharePoint Audit  "
+$tabControl.Controls.Add($tabFile)
+
+$lblFileNote = New-Object System.Windows.Forms.Label
+$lblFileNote.Location  = New-Object System.Drawing.Point(10, 14)
+$lblFileNote.Size      = New-Object System.Drawing.Size(920, 20)
+$lblFileNote.Text      = "Queries the Unified Audit Log for file uploads, downloads, and deletions. Requires Exchange Online connection. Audit logs may have up to a 24-hour delay."
+$lblFileNote.ForeColor = [System.Drawing.Color]::DimGray
+$tabFile.Controls.Add($lblFileNote)
+
+# -- Date Range --
+$lblStartDate = New-Object System.Windows.Forms.Label
+$lblStartDate.Location = New-Object System.Drawing.Point(10, 46)
+$lblStartDate.Size     = New-Object System.Drawing.Size(68, 20)
+$lblStartDate.Text     = "Start Date:"
+$tabFile.Controls.Add($lblStartDate)
+
+$dtpStart = New-Object System.Windows.Forms.DateTimePicker
+$dtpStart.Location = New-Object System.Drawing.Point(80, 43)
+$dtpStart.Size     = New-Object System.Drawing.Size(175, 26)
+$dtpStart.Format   = [System.Windows.Forms.DateTimePickerFormat]::Short
+$dtpStart.Value    = (Get-Date).AddDays(-30)
+$tabFile.Controls.Add($dtpStart)
+
+$lblEndDate = New-Object System.Windows.Forms.Label
+$lblEndDate.Location = New-Object System.Drawing.Point(270, 46)
+$lblEndDate.Size     = New-Object System.Drawing.Size(62, 20)
+$lblEndDate.Text     = "End Date:"
+$tabFile.Controls.Add($lblEndDate)
+
+$dtpEnd = New-Object System.Windows.Forms.DateTimePicker
+$dtpEnd.Location = New-Object System.Drawing.Point(335, 43)
+$dtpEnd.Size     = New-Object System.Drawing.Size(175, 26)
+$dtpEnd.Format   = [System.Windows.Forms.DateTimePickerFormat]::Short
+$dtpEnd.Value    = Get-Date
+$tabFile.Controls.Add($dtpEnd)
+
+# -- Services Group --
+$grpServices = New-Object System.Windows.Forms.GroupBox
+$grpServices.Location = New-Object System.Drawing.Point(10, 80)
+$grpServices.Size     = New-Object System.Drawing.Size(220, 110)
+$grpServices.Text     = "Services"
+$tabFile.Controls.Add($grpServices)
+
+$chkSharePoint = New-Object System.Windows.Forms.CheckBox
+$chkSharePoint.Location = New-Object System.Drawing.Point(12, 24)
+$chkSharePoint.Size     = New-Object System.Drawing.Size(160, 22)
+$chkSharePoint.Text     = "SharePoint"
+$chkSharePoint.Checked  = $true
+$grpServices.Controls.Add($chkSharePoint)
+
+$chkOneDrive = New-Object System.Windows.Forms.CheckBox
+$chkOneDrive.Location = New-Object System.Drawing.Point(12, 50)
+$chkOneDrive.Size     = New-Object System.Drawing.Size(160, 22)
+$chkOneDrive.Text     = "OneDrive"
+$chkOneDrive.Checked  = $true
+$grpServices.Controls.Add($chkOneDrive)
+
+$chkTeams = New-Object System.Windows.Forms.CheckBox
+$chkTeams.Location = New-Object System.Drawing.Point(12, 76)
+$chkTeams.Size     = New-Object System.Drawing.Size(160, 22)
+$chkTeams.Text     = "Teams"
+$chkTeams.Checked  = $true
+$grpServices.Controls.Add($chkTeams)
+
+# -- Activities Group --
+$grpActivities = New-Object System.Windows.Forms.GroupBox
+$grpActivities.Location = New-Object System.Drawing.Point(248, 80)
+$grpActivities.Size     = New-Object System.Drawing.Size(220, 110)
+$grpActivities.Text     = "Activity Types"
+$tabFile.Controls.Add($grpActivities)
+
+$chkUploads = New-Object System.Windows.Forms.CheckBox
+$chkUploads.Location = New-Object System.Drawing.Point(12, 24)
+$chkUploads.Size     = New-Object System.Drawing.Size(160, 22)
+$chkUploads.Text     = "Uploads"
+$chkUploads.Checked  = $true
+$grpActivities.Controls.Add($chkUploads)
+
+$chkDownloads = New-Object System.Windows.Forms.CheckBox
+$chkDownloads.Location = New-Object System.Drawing.Point(12, 50)
+$chkDownloads.Size     = New-Object System.Drawing.Size(160, 22)
+$chkDownloads.Text     = "Downloads"
+$chkDownloads.Checked  = $true
+$grpActivities.Controls.Add($chkDownloads)
+
+$chkDeletions = New-Object System.Windows.Forms.CheckBox
+$chkDeletions.Location = New-Object System.Drawing.Point(12, 76)
+$chkDeletions.Size     = New-Object System.Drawing.Size(160, 22)
+$chkDeletions.Text     = "Deletions"
+$chkDeletions.Checked  = $true
+$grpActivities.Controls.Add($chkDeletions)
+
+# -- Run / Export Buttons --
+$btnRunFileAudit = New-Object System.Windows.Forms.Button
+$btnRunFileAudit.Location  = New-Object System.Drawing.Point(490, 83)
+$btnRunFileAudit.Size      = New-Object System.Drawing.Size(165, 38)
+$btnRunFileAudit.Text      = "Run File Audit"
+$btnRunFileAudit.BackColor = [System.Drawing.Color]::SteelBlue
+$btnRunFileAudit.ForeColor = [System.Drawing.Color]::White
+$btnRunFileAudit.FlatStyle = "Flat"
+$tabFile.Controls.Add($btnRunFileAudit)
+
+$btnExportFile = New-Object System.Windows.Forms.Button
+$btnExportFile.Location = New-Object System.Drawing.Point(490, 135)
+$btnExportFile.Size     = New-Object System.Drawing.Size(165, 35)
+$btnExportFile.Text     = "Export Results CSV"
+$tabFile.Controls.Add($btnExportFile)
+
+# -- Record Count Label --
+$lblRecordCount = New-Object System.Windows.Forms.Label
+$lblRecordCount.Location  = New-Object System.Drawing.Point(680, 100)
+$lblRecordCount.Size      = New-Object System.Drawing.Size(250, 20)
+$lblRecordCount.Text      = ""
+$lblRecordCount.ForeColor = [System.Drawing.Color]::DimGray
+$tabFile.Controls.Add($lblRecordCount)
+
+# -- Results Grid --
+$lblFileResults = New-Object System.Windows.Forms.Label
+$lblFileResults.Location = New-Object System.Drawing.Point(10, 202)
+$lblFileResults.Size     = New-Object System.Drawing.Size(100, 20)
+$lblFileResults.Text     = "Results:"
+$tabFile.Controls.Add($lblFileResults)
+
+$dgvFileResults = New-Object System.Windows.Forms.DataGridView
+$dgvFileResults.Location            = New-Object System.Drawing.Point(10, 225)
+$dgvFileResults.Size                = New-Object System.Drawing.Size(925, 350)
+$dgvFileResults.AutoSizeColumnsMode = "Fill"
+$dgvFileResults.AllowUserToAddRows  = $false
+$dgvFileResults.ReadOnly            = $true
+$dgvFileResults.BackgroundColor     = [System.Drawing.Color]::White
+$tabFile.Controls.Add($dgvFileResults)
+
+$fileResultTable = New-Object System.Data.DataTable
+[void]$fileResultTable.Columns.Add("DateTime")
+[void]$fileResultTable.Columns.Add("User")
+[void]$fileResultTable.Columns.Add("Operation")
+[void]$fileResultTable.Columns.Add("FileName")
+[void]$fileResultTable.Columns.Add("FileExtension")
+[void]$fileResultTable.Columns.Add("SiteUrl")
+[void]$fileResultTable.Columns.Add("Workload")
+[void]$fileResultTable.Columns.Add("ClientIP")
+$dgvFileResults.DataSource = $fileResultTable
+
+# -----------------------------------------------
+# SHARED LOG  --  bottom of form
+# -----------------------------------------------
+
+$pnlLog = New-Object System.Windows.Forms.Panel
+$pnlLog.Location = New-Object System.Drawing.Point(10, 688)
+$pnlLog.Size     = New-Object System.Drawing.Size(955, 108)
+$form.Controls.Add($pnlLog)
+
+$lblLog = New-Object System.Windows.Forms.Label
+$lblLog.Location = New-Object System.Drawing.Point(0, 0)
+$lblLog.Size     = New-Object System.Drawing.Size(40, 20)
+$lblLog.Text     = "Log:"
+$pnlLog.Controls.Add($lblLog)
+
+$btnClearLog = New-Object System.Windows.Forms.Button
+$btnClearLog.Location = New-Object System.Drawing.Point(855, 0)
+$btnClearLog.Size     = New-Object System.Drawing.Size(90, 22)
+$btnClearLog.Text     = "Clear Log"
+$pnlLog.Controls.Add($btnClearLog)
+
+$txtLog = New-Object System.Windows.Forms.TextBox
+$txtLog.Location   = New-Object System.Drawing.Point(0, 22)
+$txtLog.Size       = New-Object System.Drawing.Size(955, 82)
 $txtLog.Multiline  = $true
 $txtLog.ScrollBars = "Vertical"
 $txtLog.ReadOnly   = $true
-$txtLog.Font       = $font
-$form.Controls.Add($txtLog)
+$txtLog.BackColor  = [System.Drawing.Color]::Black
+$txtLog.ForeColor  = [System.Drawing.Color]::LimeGreen
+$txtLog.Font       = New-Object System.Drawing.Font("Consolas", 8.5)
+$pnlLog.Controls.Add($txtLog)
 
-# ================================================================================
-# TAB 1 — Shared Mailbox  (original functionality, adapted for tab layout)
-# ================================================================================
+# ----------------------------
+# Button Events
+# ----------------------------
 
-$tabMailbox      = New-Object System.Windows.Forms.TabPage
-$tabMailbox.Text = "Shared Mailbox"
-$tabs.TabPages.Add($tabMailbox)
-
-# Display Name
-$lblDisplay          = New-Object System.Windows.Forms.Label
-$lblDisplay.Text     = "Display Name:"
-$lblDisplay.Location = New-Object System.Drawing.Point(20, 22)
-$lblDisplay.AutoSize = $true
-$tabMailbox.Controls.Add($lblDisplay)
-
-$txtDisplay          = New-Object System.Windows.Forms.TextBox
-$txtDisplay.Location = New-Object System.Drawing.Point(155, 20)
-$txtDisplay.Size     = New-Object System.Drawing.Size(310, 25)
-$txtDisplay.Font     = $font
-$tabMailbox.Controls.Add($txtDisplay)
-
-# Alias
-$lblAlias          = New-Object System.Windows.Forms.Label
-$lblAlias.Text     = "Alias (no @):"
-$lblAlias.Location = New-Object System.Drawing.Point(20, 62)
-$lblAlias.AutoSize = $true
-$tabMailbox.Controls.Add($lblAlias)
-
-$txtAlias          = New-Object System.Windows.Forms.TextBox
-$txtAlias.Location = New-Object System.Drawing.Point(155, 60)
-$txtAlias.Size     = New-Object System.Drawing.Size(310, 25)
-$txtAlias.Font     = $font
-$tabMailbox.Controls.Add($txtAlias)
-
-# Primary SMTP
-$lblSmtp                  = New-Object System.Windows.Forms.Label
-$lblSmtp.Text             = "Primary SMTP:"
-$lblSmtp.Location         = New-Object System.Drawing.Point(20, 102)
-$lblSmtp.AutoSize         = $true
-$tabMailbox.Controls.Add($lblSmtp)
-
-$txtSmtp                  = New-Object System.Windows.Forms.TextBox
-$txtSmtp.Location         = New-Object System.Drawing.Point(155, 100)
-$txtSmtp.Size             = New-Object System.Drawing.Size(310, 25)
-$txtSmtp.Font             = $font
-$txtSmtp.PlaceholderText  = "e.g. alias@provenit.com"
-$tabMailbox.Controls.Add($txtSmtp)
-
-# Full Access
-$lblFull          = New-Object System.Windows.Forms.Label
-$lblFull.Text     = "Full Access (one per line):"
-$lblFull.Location = New-Object System.Drawing.Point(20, 148)
-$lblFull.AutoSize = $true
-$tabMailbox.Controls.Add($lblFull)
-
-$txtFull            = New-Object System.Windows.Forms.TextBox
-$txtFull.Location   = New-Object System.Drawing.Point(20, 170)
-$txtFull.Size       = New-Object System.Drawing.Size(450, 110)
-$txtFull.Multiline  = $true
-$txtFull.ScrollBars = "Vertical"
-$txtFull.Font       = $font
-$tabMailbox.Controls.Add($txtFull)
-
-# Send As
-$lblSendAs          = New-Object System.Windows.Forms.Label
-$lblSendAs.Text     = "Send As (one per line):"
-$lblSendAs.Location = New-Object System.Drawing.Point(20, 298)
-$lblSendAs.AutoSize = $true
-$tabMailbox.Controls.Add($lblSendAs)
-
-$txtSendAs            = New-Object System.Windows.Forms.TextBox
-$txtSendAs.Location   = New-Object System.Drawing.Point(20, 320)
-$txtSendAs.Size       = New-Object System.Drawing.Size(450, 110)
-$txtSendAs.Multiline  = $true
-$txtSendAs.ScrollBars = "Vertical"
-$txtSendAs.Font       = $font
-$tabMailbox.Controls.Add($txtSendAs)
-
-# Validate + Create buttons
-$btnValidate          = New-Object System.Windows.Forms.Button
-$btnValidate.Text     = "Validate"
-$btnValidate.Location = New-Object System.Drawing.Point(20, 450)
-$btnValidate.Size     = New-Object System.Drawing.Size(120, 35)
-$btnValidate.Font     = $font
-$tabMailbox.Controls.Add($btnValidate)
-
-$btnCreate          = New-Object System.Windows.Forms.Button
-$btnCreate.Text     = "Create Mailbox"
-$btnCreate.Location = New-Object System.Drawing.Point(150, 450)
-$btnCreate.Size     = New-Object System.Drawing.Size(140, 35)
-$btnCreate.Font     = $font
-$btnCreate.Enabled  = $false
-$tabMailbox.Controls.Add($btnCreate)
-
-# Validation ListView
-$lvMailbox               = New-Object System.Windows.Forms.ListView
-$lvMailbox.Location      = New-Object System.Drawing.Point(490, 20)
-$lvMailbox.Size          = New-Object System.Drawing.Size(425, 465)
-$lvMailbox.View          = "Details"
-$lvMailbox.FullRowSelect = $true
-$lvMailbox.GridLines     = $true
-$lvMailbox.Font          = $font
-[void]$lvMailbox.Columns.Add("Type",      100)
-[void]$lvMailbox.Columns.Add("Identity",  220)
-[void]$lvMailbox.Columns.Add("Status",     85)
-$tabMailbox.Controls.Add($lvMailbox)
-
-# ================================================================================
-# TAB 2 — Calendar Permissions
-# ================================================================================
-
-$tabCal      = New-Object System.Windows.Forms.TabPage
-$tabCal.Text = "Calendar Permissions"
-$tabs.TabPages.Add($tabCal)
-
-# ── Calendar owner field + Load button ──────────────────────────────────────────
-$lblCalOwner          = New-Object System.Windows.Forms.Label
-$lblCalOwner.Text     = "Calendar Owner:"
-$lblCalOwner.Location = New-Object System.Drawing.Point(20, 24)
-$lblCalOwner.AutoSize = $true
-$lblCalOwner.Font     = $font
-$tabCal.Controls.Add($lblCalOwner)
-
-$txtCalOwner                 = New-Object System.Windows.Forms.TextBox
-$txtCalOwner.Location        = New-Object System.Drawing.Point(140, 22)
-$txtCalOwner.Size            = New-Object System.Drawing.Size(390, 25)
-$txtCalOwner.Font            = $font
-$txtCalOwner.PlaceholderText = "e.g. john@provenit.com"
-$tabCal.Controls.Add($txtCalOwner)
-
-$btnLoadPerms          = New-Object System.Windows.Forms.Button
-$btnLoadPerms.Text     = "Load Permissions"
-$btnLoadPerms.Location = New-Object System.Drawing.Point(545, 20)
-$btnLoadPerms.Size     = New-Object System.Drawing.Size(155, 30)
-$btnLoadPerms.Font     = $font
-$tabCal.Controls.Add($btnLoadPerms)
-
-# ── Current permissions label + ListView ─────────────────────────────────────────
-$lblCurrentPerms          = New-Object System.Windows.Forms.Label
-$lblCurrentPerms.Text     = "Current Calendar Permissions:"
-$lblCurrentPerms.Location = New-Object System.Drawing.Point(20, 64)
-$lblCurrentPerms.AutoSize = $true
-$lblCurrentPerms.Font     = $fontBold
-$tabCal.Controls.Add($lblCurrentPerms)
-
-$lvCalPerms               = New-Object System.Windows.Forms.ListView
-$lvCalPerms.Location      = New-Object System.Drawing.Point(20, 86)
-$lvCalPerms.Size          = New-Object System.Drawing.Size(895, 200)
-$lvCalPerms.View          = "Details"
-$lvCalPerms.FullRowSelect = $true
-$lvCalPerms.GridLines     = $true
-$lvCalPerms.Font          = $font
-[void]$lvCalPerms.Columns.Add("User",          320)
-[void]$lvCalPerms.Columns.Add("Access Rights", 220)
-[void]$lvCalPerms.Columns.Add("Is Inherited",  130)
-$tabCal.Controls.Add($lvCalPerms)
-
-# ── Grant / Update GroupBox ──────────────────────────────────────────────────────
-$grpGrant          = New-Object System.Windows.Forms.GroupBox
-$grpGrant.Text     = "Grant / Update Permission"
-$grpGrant.Location = New-Object System.Drawing.Point(20, 300)
-$grpGrant.Size     = New-Object System.Drawing.Size(895, 82)
-$grpGrant.Font     = $fontBold
-$tabCal.Controls.Add($grpGrant)
-
-$lblGrantUser          = New-Object System.Windows.Forms.Label
-$lblGrantUser.Text     = "User:"
-$lblGrantUser.Location = New-Object System.Drawing.Point(12, 32)
-$lblGrantUser.AutoSize = $true
-$lblGrantUser.Font     = $font
-$grpGrant.Controls.Add($lblGrantUser)
-
-$txtGrantUser                 = New-Object System.Windows.Forms.TextBox
-$txtGrantUser.Location        = New-Object System.Drawing.Point(55, 30)
-$txtGrantUser.Size            = New-Object System.Drawing.Size(330, 25)
-$txtGrantUser.Font            = $font
-$txtGrantUser.PlaceholderText = "user@domain.com"
-$grpGrant.Controls.Add($txtGrantUser)
-
-$lblGrantLevel          = New-Object System.Windows.Forms.Label
-$lblGrantLevel.Text     = "Permission:"
-$lblGrantLevel.Location = New-Object System.Drawing.Point(400, 32)
-$lblGrantLevel.AutoSize = $true
-$lblGrantLevel.Font     = $font
-$grpGrant.Controls.Add($lblGrantLevel)
-
-$cboGrantLevel              = New-Object System.Windows.Forms.ComboBox
-$cboGrantLevel.Location     = New-Object System.Drawing.Point(480, 29)
-$cboGrantLevel.Size         = New-Object System.Drawing.Size(195, 25)
-$cboGrantLevel.Font         = $font
-$cboGrantLevel.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
-@('Owner','PublishingEditor','Editor','PublishingAuthor','Author',
-  'NonEditingAuthor','Reviewer','AvailabilityOnly','LimitedDetails') |
-    ForEach-Object { [void]$cboGrantLevel.Items.Add($_) }
-$cboGrantLevel.SelectedIndex = 6   # Default: Reviewer
-$grpGrant.Controls.Add($cboGrantLevel)
-
-$btnGrant          = New-Object System.Windows.Forms.Button
-$btnGrant.Text     = "Grant / Update"
-$btnGrant.Location = New-Object System.Drawing.Point(695, 27)
-$btnGrant.Size     = New-Object System.Drawing.Size(145, 35)
-$btnGrant.Font     = $font
-$grpGrant.Controls.Add($btnGrant)
-
-# ── Remove GroupBox ──────────────────────────────────────────────────────────────
-$grpRemove          = New-Object System.Windows.Forms.GroupBox
-$grpRemove.Text     = "Remove Permission"
-$grpRemove.Location = New-Object System.Drawing.Point(20, 396)
-$grpRemove.Size     = New-Object System.Drawing.Size(895, 78)
-$grpRemove.Font     = $fontBold
-$tabCal.Controls.Add($grpRemove)
-
-$lblRemoveUser          = New-Object System.Windows.Forms.Label
-$lblRemoveUser.Text     = "User:"
-$lblRemoveUser.Location = New-Object System.Drawing.Point(12, 32)
-$lblRemoveUser.AutoSize = $true
-$lblRemoveUser.Font     = $font
-$grpRemove.Controls.Add($lblRemoveUser)
-
-$txtRemoveUser                 = New-Object System.Windows.Forms.TextBox
-$txtRemoveUser.Location        = New-Object System.Drawing.Point(55, 30)
-$txtRemoveUser.Size            = New-Object System.Drawing.Size(330, 25)
-$txtRemoveUser.Font            = $font
-$txtRemoveUser.PlaceholderText = "user@domain.com"
-$grpRemove.Controls.Add($txtRemoveUser)
-
-$lblRemoveHint           = New-Object System.Windows.Forms.Label
-$lblRemoveHint.Text      = "Tip: click a row in the list above to auto-fill both user fields."
-$lblRemoveHint.Location  = New-Object System.Drawing.Point(400, 34)
-$lblRemoveHint.AutoSize  = $true
-$lblRemoveHint.Font      = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Italic)
-$lblRemoveHint.ForeColor = [System.Drawing.Color]::DimGray
-$grpRemove.Controls.Add($lblRemoveHint)
-
-$btnRemove          = New-Object System.Windows.Forms.Button
-$btnRemove.Text     = "Remove"
-$btnRemove.Location = New-Object System.Drawing.Point(695, 27)
-$btnRemove.Size     = New-Object System.Drawing.Size(145, 35)
-$btnRemove.Font     = $font
-$grpRemove.Controls.Add($btnRemove)
-
-# ================================================================================
-# State
-# ================================================================================
-
-$script:validated   = $false
-$script:validFull   = @()
-$script:validSendAs = @()
-
-# ================================================================================
-# Event Handlers — Connect (shared)
-# ================================================================================
-
-$btnConnect.Add_Click({
+$btnConnectEXO.Add_Click({
     try {
-        Write-Log $txtLog "Connecting to Exchange Online..."
-        Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop | Out-Null
-        Write-Log $txtLog "Connected successfully."
-        $lblConnStatus.Text      = "Connected"
-        $lblConnStatus.ForeColor = [System.Drawing.Color]::Green
-    }
-    catch {
-        Write-Log $txtLog "CONNECT FAILED: $($_.Exception.Message)"
-        $lblConnStatus.Text      = "Connection failed"
-        $lblConnStatus.ForeColor = [System.Drawing.Color]::Red
-    }
-})
-
-# ================================================================================
-# Event Handlers — Shared Mailbox tab
-# ================================================================================
-
-$btnValidate.Add_Click({
-    $lvMailbox.Items.Clear()
-    $script:validated   = $false
-    $script:validFull   = @()
-    $script:validSendAs = @()
-    $btnCreate.Enabled  = $false
-
-    $display = $txtDisplay.Text.Trim()
-    $alias   = $txtAlias.Text.Trim()
-    $smtp    = $txtSmtp.Text.Trim()
-    $ok      = $true
-
-    if ([string]::IsNullOrWhiteSpace($display)) {
-        Write-Log $txtLog "Display Name is required."
-        $ok = $false
-    }
-
-    if (-not (Test-MailAlias -Alias $alias)) {
-        Write-Log $txtLog "Alias is invalid - use alphanumeric only, no @ symbol."
-        $ok = $false
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($smtp)) {
-        if ($smtp -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
-            Write-Log $txtLog "Primary SMTP doesn't look like a valid email address."
-            $ok = $false
-        }
-    }
-
-    foreach ($u in (Split-Entries $txtFull.Text)) {
-        $r    = Get-RecipientSafe $u
-        $item = New-Object System.Windows.Forms.ListViewItem("FullAccess")
-        [void]$item.SubItems.Add($u)
-        if ($null -ne $r) {
-            [void]$item.SubItems.Add("OK")
-            $script:validFull += $r.PrimarySmtpAddress.ToString()
+        Write-Log "Connecting to Exchange Online..."
+        Connect-ExchangeOnline -ShowBanner:$false
+        if (Test-ExchangeConnection) {
+            Write-Log "Exchange Online connection successful."
         }
         else {
-            [void]$item.SubItems.Add("NOT FOUND")
-            $item.ForeColor = [System.Drawing.Color]::Red
-            $ok = $false
+            Write-Log "Exchange Online connection test did not succeed."
         }
-        [void]$lvMailbox.Items.Add($item)
-    }
-
-    foreach ($u in (Split-Entries $txtSendAs.Text)) {
-        $r    = Get-RecipientSafe $u
-        $item = New-Object System.Windows.Forms.ListViewItem("SendAs")
-        [void]$item.SubItems.Add($u)
-        if ($null -ne $r) {
-            [void]$item.SubItems.Add("OK")
-            $script:validSendAs += $r.PrimarySmtpAddress.ToString()
-        }
-        else {
-            [void]$item.SubItems.Add("NOT FOUND")
-            $item.ForeColor = [System.Drawing.Color]::Red
-            $ok = $false
-        }
-        [void]$lvMailbox.Items.Add($item)
-    }
-
-    if ($ok) {
-        $script:validated  = $true
-        $btnCreate.Enabled = $true
-        Write-Log $txtLog "Validation passed - click Create Mailbox to proceed."
-    }
-    else {
-        Write-Log $txtLog "Validation failed. Fix NOT FOUND items and validate again."
-    }
-})
-
-$btnCreate.Add_Click({
-    if (-not $script:validated) { Write-Log $txtLog "Please run Validate first."; return }
-
-    $display = $txtDisplay.Text.Trim()
-    $alias   = $txtAlias.Text.Trim()
-    $smtp    = $txtSmtp.Text.Trim()
-
-    try {
-        Write-Log $txtLog "Creating shared mailbox: DisplayName='$display'  Alias='$alias'  SMTP='$smtp'"
-
-        $params = @{
-            Shared      = $true
-            Name        = $display
-            DisplayName = $display
-            Alias       = $alias
-            ErrorAction = 'Stop'
-        }
-        if (-not [string]::IsNullOrWhiteSpace($smtp)) { $params.PrimarySmtpAddress = $smtp }
-
-        New-Mailbox @params | Out-Null
-        Write-Log $txtLog "Mailbox creation submitted - waiting for EXO propagation..."
-
-        $idToFind = if ($smtp) { $smtp } else { $alias }
-        $mbx = $null
-        for ($i = 1; $i -le 12; $i++) {
-            Start-Sleep -Seconds 5
-            $mbx = Get-Mailbox -Identity $idToFind -ErrorAction SilentlyContinue
-            if ($mbx) { break }
-            Write-Log $txtLog "  Waiting... attempt $i/12"
-        }
-        if (-not $mbx) {
-            throw "Mailbox not found after waiting. Permissions can be applied manually once it appears."
-        }
-
-        $mailboxId = $mbx.PrimarySmtpAddress.ToString()
-        Write-Log $txtLog "Mailbox confirmed: $mailboxId"
-
-        foreach ($u in $script:validFull) {
-            Write-Log $txtLog "  FullAccess  → $u"
-            Add-MailboxPermission -Identity $mailboxId -User $u `
-                -AccessRights FullAccess -InheritanceType All -AutoMapping:$true `
-                -ErrorAction Stop | Out-Null
-        }
-
-        foreach ($u in $script:validSendAs) {
-            Write-Log $txtLog "  SendAs      → $u"
-            Add-RecipientPermission -Identity $mailboxId -Trustee $u `
-                -AccessRights SendAs -Confirm:$false -ErrorAction Stop | Out-Null
-        }
-
-        Write-Log $txtLog "Done."
-        [System.Windows.Forms.MessageBox]::Show(
-            "Shared mailbox created and permissions applied.`r`n$mailboxId",
-            "Success", "OK", "Information"
-        ) | Out-Null
     }
     catch {
-        Write-Log $txtLog "ERROR: $($_.Exception.Message)"
-        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "Error", "OK", "Error") | Out-Null
+        Write-Log "Exchange Online connection failed: $($_.Exception.Message)"
     }
+    Update-ConnectionStatus
 })
 
-# ================================================================================
-# Event Handlers — Calendar Permissions tab
-# ================================================================================
-
-# Click a row → auto-fill both user fields and match the permission level
-$lvCalPerms.Add_SelectedIndexChanged({
-    if ($lvCalPerms.SelectedItems.Count -eq 0) { return }
-    $sel  = $lvCalPerms.SelectedItems[0]
-    $user = $sel.Text
-    # Skip system entries — they can be updated but not removed
-    if ($user -notin @('Default', 'Anonymous')) {
-        $txtGrantUser.Text  = $user
-        $txtRemoveUser.Text = $user
-    }
-    # Match permission level in dropdown if possible
-    $currentLevel = $sel.SubItems[1].Text.Trim()
-    $idx = $cboGrantLevel.Items.IndexOf($currentLevel)
-    if ($idx -ge 0) { $cboGrantLevel.SelectedIndex = $idx }
-})
-
-$btnLoadPerms.Add_Click({
-    $mailbox = $txtCalOwner.Text.Trim()
-    if ([string]::IsNullOrWhiteSpace($mailbox)) {
-        Write-Log $txtLog "Calendar: Enter a mailbox address first."
-        return
-    }
-
-    $lvCalPerms.Items.Clear()
-
+$btnConnectIPPS.Add_Click({
     try {
-        Write-Log $txtLog "Calendar: Loading permissions for $mailbox ..."
-        $calPath = Get-CalendarIdentity -Mailbox $mailbox
-        $perms   = Get-MailboxFolderPermission -Identity $calPath -ErrorAction Stop
+        Write-Log "Connecting to IPPS / Compliance session..."
+        Connect-IPPSSession -EnableSearchOnlySession
+        if (Test-IPPSConnection) {
+            Write-Log "IPPS connection successful."
+        }
+        else {
+            Write-Log "IPPS connection test did not succeed."
+        }
+    }
+    catch {
+        Write-Log "IPPS connection failed: $($_.Exception.Message)"
+    }
+    Update-ConnectionStatus
+})
 
-        foreach ($p in $perms) {
-            $item = New-Object System.Windows.Forms.ListViewItem($p.User.ToString())
-            [void]$item.SubItems.Add(($p.AccessRights -join ', '))
-            [void]$item.SubItems.Add($(if ($p.IsInherited) { 'Yes' } else { 'No' }))
-            # Dim system default entries
-            if ($p.User.ToString() -in @('Default', 'Anonymous')) {
-                $item.ForeColor = [System.Drawing.Color]::Gray
+# -- Email Audit Run --
+$btnRunAudit.Add_Click({
+    try {
+        $mailbox = $txtUserEmail.Text.Trim()
+
+        if ([string]::IsNullOrWhiteSpace($mailbox)) {
+            [System.Windows.Forms.MessageBox]::Show("Please enter a user email address at the top of the window.", "Missing Email")
+            return
+        }
+        if (-not (Test-ExchangeConnection)) {
+            [System.Windows.Forms.MessageBox]::Show("Exchange Online is not connected.", "Connection Required")
+            return
+        }
+        if (-not (Test-IPPSConnection)) {
+            [System.Windows.Forms.MessageBox]::Show("IPPS / Compliance session is not connected. This is required for the Email Audit.", "Connection Required")
+            return
+        }
+
+        $domains    = $txtDomains.Lines
+        $query      = Build-ContentMatchQuery -Domains $domains
+        $searchName = "TermAudit-$($mailbox.Replace('@','_').Replace('.','_'))-$(Get-Date -Format yyyyMMddHHmmss)"
+
+        Write-Log "Starting email audit for: $mailbox"
+        Write-Log "Query: $query"
+        Write-Log "Creating compliance search: $searchName"
+
+        New-ComplianceSearch -Name $searchName -ExchangeLocation $mailbox -ContentMatchQuery $query -ErrorAction Stop | Out-Null
+        Start-ComplianceSearch -Identity $searchName -ErrorAction Stop | Out-Null
+
+        $searchResult = Wait-ComplianceSearchComplete -SearchName $searchName
+
+        $row = $emailResultTable.NewRow()
+        $row["Mailbox"]    = $mailbox
+        $row["SearchName"] = $searchResult.Name
+        $row["Status"]     = $searchResult.Status
+        $row["Items"]      = $searchResult.Items
+        $row["Size"]       = $searchResult.Size
+        $row["Query"]      = $query
+        $emailResultTable.Rows.Add($row)
+
+        Write-Log "Email audit complete. Items found: $($searchResult.Items) | Size: $($searchResult.Size)"
+    }
+    catch {
+        Write-Log "Email audit failed: $($_.Exception.Message)"
+    }
+})
+
+# -- Email Audit Export --
+$btnExportEmail.Add_Click({
+    try {
+        if ($emailResultTable.Rows.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("There are no results to export.", "No Results")
+            return
+        }
+        $saveDialog          = New-Object System.Windows.Forms.SaveFileDialog
+        $saveDialog.Filter   = "CSV files (*.csv)|*.csv"
+        $saveDialog.Title    = "Save email audit results"
+        $saveDialog.FileName = "EmailAuditResults_$(Get-Date -Format yyyyMMdd_HHmmss).csv"
+
+        if ($saveDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $emailResultTable | Export-Csv -Path $saveDialog.FileName -NoTypeInformation -Encoding UTF8
+            Write-Log "Email results exported to: $($saveDialog.FileName)"
+        }
+    }
+    catch {
+        Write-Log "Export failed: $($_.Exception.Message)"
+    }
+})
+
+# -- File Activity Audit Run --
+$btnRunFileAudit.Add_Click({
+    try {
+        $user = $txtUserEmail.Text.Trim()
+
+        if ([string]::IsNullOrWhiteSpace($user)) {
+            [System.Windows.Forms.MessageBox]::Show("Please enter a user email address at the top of the window.", "Missing Email")
+            return
+        }
+        if (-not (Test-ExchangeConnection)) {
+            [System.Windows.Forms.MessageBox]::Show("Exchange Online is not connected. This is required to query the Unified Audit Log.", "Connection Required")
+            return
+        }
+        if (-not ($chkSharePoint.Checked -or $chkOneDrive.Checked -or $chkTeams.Checked)) {
+            [System.Windows.Forms.MessageBox]::Show("Please select at least one service.", "No Services Selected")
+            return
+        }
+
+        # Build operations list from checkbox selections
+        $operations = [System.Collections.Generic.List[string]]::new()
+        if ($chkUploads.Checked) {
+            $operations.AddRange([string[]]@(
+                "FileUploaded",
+                "FileCheckedIn",
+                "FileSyncUploadedFull",
+                "FileModified",
+                "FileModifiedExtended"
+            ))
+        }
+        if ($chkDownloads.Checked) {
+            $operations.AddRange([string[]]@(
+                "FileDownloaded",
+                "FileCheckedOut",
+                "FileSyncDownloadedFull",
+                "FileAccessed",
+                "FileAccessedExtended"
+            ))
+        }
+        if ($chkDeletions.Checked) {
+            $operations.AddRange([string[]]@(
+                "FileDeleted",
+                "FileRecycled",
+                "FileDeletedFirstStageRecycleBin",
+                "FileDeletedSecondStageRecycleBin",
+                "FileVersionsAllDeleted"
+            ))
+        }
+
+        if ($operations.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("Please select at least one activity type.", "No Activities Selected")
+            return
+        }
+
+        $startDate = $dtpStart.Value.Date
+        $endDate   = $dtpEnd.Value.Date.AddDays(1).AddSeconds(-1)
+
+        if ($startDate -gt $endDate) {
+            [System.Windows.Forms.MessageBox]::Show("Start date must be before end date.", "Invalid Date Range")
+            return
+        }
+
+        $fileResultTable.Rows.Clear()
+        $lblRecordCount.Text = ""
+        $totalRecords        = 0
+        $sessionId           = "FileAudit-$(Get-Date -Format yyyyMMddHHmmss)"
+        $page                = 1
+
+        Write-Log "Starting file activity audit for: $user"
+        Write-Log "Date range: $($startDate.ToString('yyyy-MM-dd')) to $($dtpEnd.Value.Date.ToString('yyyy-MM-dd'))"
+        Write-Log "Operations: $($operations -join ', ')"
+
+        do {
+            Write-Log "Fetching page $page of audit records..."
+
+            $results = Search-UnifiedAuditLog `
+                -StartDate  $startDate `
+                -EndDate    $endDate `
+                -UserIds    $user `
+                -Operations $operations.ToArray() `
+                -ResultSize 5000 `
+                -SessionId  $sessionId `
+                -SessionCommand ReturnLargeSet `
+                -ErrorAction Stop
+
+            if ($null -eq $results -or $results.Count -eq 0) { break }
+
+            foreach ($record in $results) {
+                try {
+                    $auditData = $record.AuditData | ConvertFrom-Json
+                    $workload  = [string]$auditData.Workload
+                    $siteUrl   = [string]$auditData.SiteUrl
+
+                    # Determine whether this record matches the selected services.
+                    # OneDrive personal sites contain "-my.sharepoint.com" in the URL.
+                    $isOneDrive    = ($workload -eq "OneDrive") -or
+                                     ($workload -eq "SharePoint" -and $siteUrl -match "-my\.sharepoint\.com")
+                    $isSharePoint  = ($workload -eq "SharePoint") -and ($siteUrl -notmatch "-my\.sharepoint\.com")
+                    $isTeams       = ($workload -eq "MicrosoftTeams")
+
+                    $include = ($chkOneDrive.Checked   -and $isOneDrive)  -or
+                               ($chkSharePoint.Checked -and $isSharePoint) -or
+                               ($chkTeams.Checked      -and $isTeams)
+
+                    if ($include) {
+                        $row = $fileResultTable.NewRow()
+                        $row["DateTime"]      = $record.CreationDate.ToString("yyyy-MM-dd HH:mm:ss")
+                        $row["User"]          = [string]$auditData.UserId
+                        $row["Operation"]     = [string]$auditData.Operation
+                        $row["FileName"]      = [string]$auditData.SourceFileName
+                        $row["FileExtension"] = [string]$auditData.SourceFileExtension
+                        $row["SiteUrl"]       = $siteUrl
+                        $row["Workload"]      = $workload
+                        $row["ClientIP"]      = [string]$auditData.ClientIP
+                        $fileResultTable.Rows.Add($row)
+                        $totalRecords++
+                    }
+                }
+                catch {
+                    Write-Log "Warning: Could not parse audit record -- $($_.Exception.Message)"
+                }
             }
-            [void]$lvCalPerms.Items.Add($item)
-        }
 
-        Write-Log $txtLog "Calendar: $($perms.Count) permission entr$(if ($perms.Count -eq 1){'y'}else{'ies'}) loaded."
+            $lblRecordCount.Text = "Records loaded: $totalRecords"
+            [System.Windows.Forms.Application]::DoEvents()
+            $page++
+
+        } while ($results.Count -eq 5000)
+
+        $lblRecordCount.Text = "Records found: $totalRecords"
+        Write-Log "File activity audit complete. Records found: $totalRecords"
+
+        if ($totalRecords -eq 0) {
+            Write-Log "No records matched. Check date range, user email, and service selections."
+            Write-Log "Note: The Unified Audit Log can have up to a 24-hour ingestion delay."
+        }
     }
     catch {
-        Write-Log $txtLog "Calendar ERROR (load): $($_.Exception.Message)"
+        Write-Log "File audit failed: $($_.Exception.Message)"
     }
 })
 
-$btnGrant.Add_Click({
-    $mailbox = $txtCalOwner.Text.Trim()
-    $user    = $txtGrantUser.Text.Trim()
-    $level   = $cboGrantLevel.SelectedItem
-
-    if ([string]::IsNullOrWhiteSpace($mailbox) -or [string]::IsNullOrWhiteSpace($user)) {
-        Write-Log $txtLog "Calendar: Both Calendar Owner and User fields are required."
-        return
-    }
-
+# -- File Activity Export --
+$btnExportFile.Add_Click({
     try {
-        $calPath  = Get-CalendarIdentity -Mailbox $mailbox
-        $existing = Get-MailboxFolderPermission -Identity $calPath -User $user -ErrorAction SilentlyContinue
-
-        if ($existing) {
-            Write-Log $txtLog "Calendar: Updating $user → $level on $mailbox ..."
-            Set-MailboxFolderPermission -Identity $calPath -User $user `
-                -AccessRights $level -ErrorAction Stop | Out-Null
-            Write-Log $txtLog "Calendar: Permission updated."
+        if ($fileResultTable.Rows.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("There are no results to export.", "No Results")
+            return
         }
-        else {
-            Write-Log $txtLog "Calendar: Granting $user → $level on $mailbox ..."
-            Add-MailboxFolderPermission -Identity $calPath -User $user `
-                -AccessRights $level -ErrorAction Stop | Out-Null
-            Write-Log $txtLog "Calendar: Permission granted."
-        }
+        $saveDialog          = New-Object System.Windows.Forms.SaveFileDialog
+        $saveDialog.Filter   = "CSV files (*.csv)|*.csv"
+        $saveDialog.Title    = "Save file activity audit results"
+        $saveDialog.FileName = "FileActivityAuditResults_$(Get-Date -Format yyyyMMdd_HHmmss).csv"
 
-        $btnLoadPerms.PerformClick()   # Refresh the list
+        if ($saveDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $fileResultTable | Export-Csv -Path $saveDialog.FileName -NoTypeInformation -Encoding UTF8
+            Write-Log "File results exported to: $($saveDialog.FileName)"
+        }
     }
     catch {
-        Write-Log $txtLog "Calendar ERROR (grant): $($_.Exception.Message)"
+        Write-Log "Export failed: $($_.Exception.Message)"
     }
 })
 
-$btnRemove.Add_Click({
-    $mailbox = $txtCalOwner.Text.Trim()
-    $user    = $txtRemoveUser.Text.Trim()
-
-    if ([string]::IsNullOrWhiteSpace($mailbox) -or [string]::IsNullOrWhiteSpace($user)) {
-        Write-Log $txtLog "Calendar: Both Calendar Owner and User fields are required."
-        return
-    }
-
-    # Prevent accidental removal of system entries
-    if ($user -in @('Default', 'Anonymous')) {
-        Write-Log $txtLog "Calendar: '$user' is a system entry - use Grant/Update to change its access level instead."
-        return
-    }
-
-    $confirm = [System.Windows.Forms.MessageBox]::Show(
-        "Remove calendar permission for '$user' on '$mailbox'?",
-        "Confirm Remove", "YesNo", "Warning"
-    )
-    if ($confirm -ne 'Yes') { return }
-
-    try {
-        $calPath = Get-CalendarIdentity -Mailbox $mailbox
-        Write-Log $txtLog "Calendar: Removing permission for $user on $mailbox ..."
-        Remove-MailboxFolderPermission -Identity $calPath -User $user `
-            -Confirm:$false -ErrorAction Stop
-        Write-Log $txtLog "Calendar: Permission removed."
-
-        $txtRemoveUser.Clear()
-        $txtGrantUser.Clear()
-        $btnLoadPerms.PerformClick()   # Refresh the list
-    }
-    catch {
-        Write-Log $txtLog "Calendar ERROR (remove): $($_.Exception.Message)"
-    }
+$btnClearLog.Add_Click({
+    $txtLog.Clear()
 })
 
-# ================================================================================
-# Launch
-# ================================================================================
+# ----------------------------
+# Launch Form
+# ----------------------------
 
 [void]$form.ShowDialog()
