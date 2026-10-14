@@ -677,7 +677,7 @@ $txtSmtp                  = New-Object System.Windows.Forms.TextBox
 $txtSmtp.Location         = New-Object System.Drawing.Point(155, 100)
 $txtSmtp.Size             = New-Object System.Drawing.Size(310, 25)
 $txtSmtp.Font             = $font
-Add-PlaceholderBehavior $txtSmtp "e.g. alias@provenit.com"
+Add-PlaceholderBehavior $txtSmtp "e.g. alias@domain.com"
 $tabMailbox.Controls.Add($txtSmtp)
 
 # Full Access
