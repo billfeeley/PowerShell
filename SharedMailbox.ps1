@@ -77,7 +77,7 @@ $txtSmtp = New-Object System.Windows.Forms.TextBox
 $txtSmtp.Location = New-Object System.Drawing.Point(140,98)
 $txtSmtp.Size = New-Object System.Drawing.Size(320,25)
 $txtSmtp.Font = $font
-$txtSmtp.PlaceholderText = "example: alias@provenit.com"
+$txtSmtp.PlaceholderText = "example: alias@domain.com"
 $form.Controls.Add($txtSmtp)
 
 $lblFull = New-Object System.Windows.Forms.Label
